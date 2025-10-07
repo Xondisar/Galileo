@@ -1,5 +1,14 @@
 import math
 
+from src.turret_ai.geometry import Vector3, solve_intercept_time
+from src.turret_ai.turret import (
+    AmmunitionType,
+    ManualWaypoint,
+    ObstructionSample,
+    Target,
+    Turret,
+    TurretConfig,
+)
 from turret_ai.geometry import Vector3, solve_intercept_time
 from turret_ai.turret import Target, Turret, TurretConfig
 
@@ -38,6 +47,12 @@ def test_turret_leads_moving_target():
     config = TurretConfig(
         fire_arc_deg=3.0,
         max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        max_prediction_time=5.0,
+    )
+    config.ammunition_types = (
+        AmmunitionType("standard", projectile_speed=45.0, damage=10.0),
+    )
         projectile_speed=45.0,
         fire_cooldown=0.05,
         max_prediction_time=5.0,
@@ -81,4 +96,258 @@ def test_solve_intercept_time_handles_parallel_motion():
     time = solve_intercept_time(origin, target_position, target_velocity, projectile_speed)
 
     assert math.isclose(time, math.sqrt(4 / 3), rel_tol=1e-3)
+
+
+def test_obstruction_prevents_fire():
+    config = TurretConfig(
+        fire_arc_deg=2.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        obstruction_check=lambda origin, target: False,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("blocked", Vector3(0, 0, 15), Vector3(0, 0, 0))
+
+    turret.state.tracked_target = target
+    for _ in range(10):
+        assert turret.update(0.1, [target]) is None
+
+    assert turret.state.cooldown == 0.0
+
+
+def test_heat_management_throttles_firing():
+    ammo = AmmunitionType("burst", projectile_speed=60.0, damage=15.0, heat_per_shot=5.0)
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        overheat_threshold=5.0,
+        heat_resume_threshold=1.0,
+        heat_capacity=6.0,
+        heat_dissipation_rate=0.5,
+        ammunition_types=(ammo,),
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("runner", Vector3(0, 0, 20), Vector3(0, 0, 0))
+
+    turret.state.tracked_target = target
+    first_shot = None
+    for _ in range(5):
+        fired = turret.update(0.1, [target])
+        if fired:
+            first_shot = fired
+            break
+
+    assert first_shot == "runner"
+    assert turret.state.overheated
+
+    cooled = False
+    fired_again = None
+    for _ in range(200):
+        fired = turret.update(0.1, [target])
+        if not turret.state.overheated:
+            cooled = True
+        if cooled and fired:
+            fired_again = fired
+            break
+
+    assert cooled
+    assert fired_again == "runner"
+
+
+def test_ammunition_switch_updates_prediction():
+    slow = AmmunitionType("slow", projectile_speed=30.0, damage=8.0)
+    fast = AmmunitionType("fast", projectile_speed=80.0, damage=6.0)
+    config = TurretConfig(
+        fire_arc_deg=3.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        max_prediction_time=5.0,
+        ammunition_types=(slow, fast),
+        default_ammunition="slow",
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    moving = Target("runner", Vector3(-10, 0, 40), Vector3(8, 0, -6))
+
+    for _ in range(10):
+        turret.update(0.1, [moving])
+        moving = Target(
+            moving.id,
+            moving.predict_position(0.1),
+            moving.velocity,
+            moving.is_airborne,
+            moving.priority,
+        )
+
+    slow_time = turret.state.last_prediction_time
+
+    turret.set_ammunition("fast")
+    for _ in range(10):
+        turret.update(0.1, [moving])
+        moving = Target(
+            moving.id,
+            moving.predict_position(0.1),
+            moving.velocity,
+            moving.is_airborne,
+            moving.priority,
+        )
+
+    fast_time = turret.state.last_prediction_time
+
+    assert fast_time < slow_time
+
+
+def test_idle_scan_animates_without_targets():
+    turret = Turret(position=Vector3(0, 0, 0))
+    initial_yaw = turret.state.yaw_deg
+
+    for _ in range(20):
+        turret.update(0.1, [])
+
+    assert not math.isclose(turret.state.yaw_deg, initial_yaw)
+
+
+def test_manual_override_sets_orientation():
+    turret = Turret(position=Vector3(0, 0, 0))
+    turret.engage_manual_override(45.0, 10.0)
+
+    for _ in range(10):
+        turret.update(0.1, [])
+
+    assert math.isclose(turret.state.yaw_deg, 45.0, abs_tol=1.0)
+    assert math.isclose(turret.state.pitch_deg, 10.0, abs_tol=1.0)
+
+
+def test_heat_feedback_callback_invoked():
+    events = []
+
+    def on_heat(heat: float, _capacity: float, overheated: bool) -> None:
+        events.append((heat, overheated))
+
+    ammo = AmmunitionType("hot", projectile_speed=60.0, damage=12.0, heat_per_shot=2.5)
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        heat_capacity=6.0,
+        overheat_threshold=5.0,
+        heat_dissipation_rate=0.1,
+        ammunition_types=(ammo,),
+        heat_feedback=on_heat,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("feedback", Vector3(0, 0, 20), Vector3(0, 0, 0))
+    turret.state.tracked_target = target
+
+    fired = None
+    for _ in range(10):
+        fired = turret.update(0.1, [target])
+        if fired:
+            break
+
+    assert fired == "feedback"
+    assert events
+    heat_values = [value for value, _ in events]
+    assert any(value > 0 for value in heat_values)
+
+
+def test_power_management_blocks_when_empty():
+    ammo = AmmunitionType("charged", projectile_speed=60.0, damage=9.0, heat_per_shot=0.5)
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        heat_capacity=10.0,
+        overheat_threshold=9.0,
+        heat_dissipation_rate=1.0,
+        ammunition_types=(ammo,),
+        power_capacity=1.5,
+        power_per_shot=1.5,
+        power_recharge_rate=0.0,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("power", Vector3(0, 0, 15), Vector3(0, 0, 0))
+    turret.state.tracked_target = target
+
+    fired = None
+    for _ in range(10):
+        fired = turret.update(0.1, [target])
+        if fired:
+            break
+
+    assert fired == "power"
+    assert math.isclose(turret.state.power, 0.0, abs_tol=1e-6)
+
+    blocked = True
+    for _ in range(20):
+        result = turret.update(0.1, [target])
+        if result:
+            blocked = False
+            break
+
+    assert blocked
+
+
+def test_manual_waypoint_burst_fire():
+    ammo = AmmunitionType("manual", projectile_speed=50.0, damage=5.0, heat_per_shot=0.2)
+    config = TurretConfig(
+        fire_arc_deg=2.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        heat_capacity=20.0,
+        heat_dissipation_rate=1.0,
+        ammunition_types=(ammo,),
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    turret.engage_manual_override(
+        10.0,
+        5.0,
+        waypoints=[
+            ManualWaypoint(10.0, 5.0, dwell_time=0.2, fire_burst=2, burst_interval=0.05),
+            ManualWaypoint(-10.0, 5.0, dwell_time=0.3),
+        ],
+    )
+
+    shots: list[str] = []
+    for _ in range(80):
+        fired = turret.update(0.05, [])
+        if fired:
+            shots.append(fired)
+
+    assert shots.count("manual_override_burst") >= 2
+    assert not turret.state.manual_waypoints
+    assert math.isclose(turret.state.yaw_deg, -10.0, abs_tol=2.0)
+
+
+def test_obstruction_sample_data_respected():
+    ammo = AmmunitionType("block", projectile_speed=55.0, damage=8.0)
+    blocked_sample = ObstructionSample(blocked=True, hit_position=Vector3(0, 0, 8))
+
+    config = TurretConfig(
+        fire_arc_deg=3.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        ammunition_types=(ammo,),
+        obstruction_check=lambda origin, target: blocked_sample,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("covered", Vector3(0, 0, 20), Vector3(0, 0, 0))
+    turret.state.tracked_target = target
+
+    for _ in range(10):
+        assert turret.update(0.1, [target]) is None
+
+    assert turret.state.last_obstruction is blocked_sample
+
+    turret.config.obstruction_check = lambda origin, target: ObstructionSample(blocked=False, navigation_cost=1.5)
+
+    fired = None
+    for _ in range(20):
+        fired = turret.update(0.1, [target])
+        if fired:
+            break
+
+    assert fired == "covered"
+    assert turret.state.last_obstruction is not None
+    assert not turret.state.last_obstruction.blocked
 
