@@ -46,6 +46,8 @@ Key tuning parameters on `TurretConfig`:
 - `ammunition_types`: define projectile speed, damage, and heat footprint for each ammo class. The active ammunition can be cycled at runtime.
 - `obstruction_check`: optional callback used for ray/shape tests so the turret respects cover when lining up a shot.
 - `heat_*` values: configure heat capacity, overheating thresholds, and passive dissipation to throttle sustained fire.
+- `heat_feedback`: hook for relaying heat changes to VFX/audio or downstream systems.
+- `power_*` values: optional energy management that throttles firing when batteries are drained.
 - `max_prediction_time`: cap on lead prediction to avoid chasing very distant solutions.
 - `fire_cooldown`: configurable cadence between shots.
 - `idle_scan_*`: tune the amplitude and speed of the idle scanning animation when no targets are available.
@@ -55,16 +57,18 @@ Key tuning parameters on `TurretConfig`:
 Beyond predictive aiming, the turret now models:
 
 - Multiple ammunition archetypes with distinct projectile speeds, damage, and heat costs, plus helpers to cycle or select ammunition in response to threats.
-- Line-of-sight gating through a user-provided obstruction check so terrain and cover block shots.
-- Heat management that enforces cooldown windows when the barrel overheats.
+- Line-of-sight gating through a user-provided obstruction check that can return detailed scene query data (e.g. navmesh hits) so terrain and cover block shots while exposing impact metadata.
+- Heat management that drives optional visual/audio feedback hooks and ties into configurable power draw requirements when firing.
 - Idle scanning behaviour to keep the turret lively when no targets are tracked.
-- Manual override controls for designers to script cinematic moves or let players temporarily take command.
+- Manual override controls with waypoint queues and scripted burst fire so designers can choreograph sequences or let players temporarily take command.
+
+Manual override sequences are described with `ManualWaypoint` objects which include dwell windows and optional burst fire counts to choreograph camera-ready sweeps.
 
 ### Extensibility ideas
 
 Future enhancements could include:
 
-- Hooking the heat system to visual/audio feedback or power draw requirements.
-- Expanding manual override with queued waypoints and scripted burst fire.
-- Integrating the obstruction callback with a full scene query or navmesh for complex environments.
+- Integrating cooperative target designations from allied sensors.
+- Adding spatial audio occlusion based on the obstruction metadata.
+- Driving animation rigs directly from the turret orientation to blend with character poses.
 

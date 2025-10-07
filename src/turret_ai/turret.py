@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Callable, Iterable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 from .geometry import Vector3, UP, solve_intercept_time
 
@@ -47,7 +47,9 @@ class TurretConfig:
     fire_cooldown: float = 0.2
     ammunition_types: Sequence[AmmunitionType] = field(default_factory=tuple)
     default_ammunition: Optional[str] = None
-    obstruction_check: Optional[Callable[[Vector3, Vector3], bool]] = None
+    obstruction_check: Optional[
+        Callable[[Vector3, Vector3], Union[bool, "ObstructionSample"]]
+    ] = None
     heat_capacity: float = 12.0
     overheat_threshold: float = 9.0
     heat_resume_threshold: float = 4.0
@@ -55,6 +57,32 @@ class TurretConfig:
     idle_scan_speed_deg: float = 25.0
     idle_scan_yaw_range_deg: float = 45.0
     idle_scan_pitch_deg: float = 6.0
+    heat_feedback: Optional[Callable[[float, float, bool], None]] = None
+    power_capacity: float = 0.0
+    power_per_shot: float = 0.0
+    power_recharge_rate: float = 0.0
+    power_feedback: Optional[Callable[[float, float], None]] = None
+
+
+@dataclass(frozen=True)
+class ObstructionSample:
+    """Result data from the obstruction callback for complex environments."""
+
+    blocked: bool
+    hit_position: Optional[Vector3] = None
+    surface_normal: Optional[Vector3] = None
+    navigation_cost: float = 0.0
+
+
+@dataclass
+class ManualWaypoint:
+    """Queued manual override orientation with scripted burst behaviour."""
+
+    yaw_deg: float
+    pitch_deg: float
+    dwell_time: float = 0.5
+    fire_burst: int = 0
+    burst_interval: float = 0.1
 
 
 @dataclass
@@ -73,6 +101,13 @@ class TurretState:
     manual_yaw_deg: float = 0.0
     manual_pitch_deg: float = 0.0
     manual_fire_request: bool = False
+    manual_waypoints: List[ManualWaypoint] = field(default_factory=list)
+    manual_waypoint_timer: float = 0.0
+    manual_burst_shots_remaining: int = 0
+    manual_burst_cooldown: float = 0.0
+    manual_burst_interval: float = 0.0
+    power: float = 0.0
+    last_obstruction: Optional[ObstructionSample] = None
 
 
 @dataclass
@@ -98,6 +133,8 @@ class Turret:
 
         selected = self._resolve_ammunition(self.config.default_ammunition)
         self.state.current_ammunition = selected
+        if self.config.power_capacity > 0:
+            self.state.power = self.config.power_capacity
 
     def select_target(self, candidates: Iterable[Target]) -> Optional[Target]:
         """Pick the highest priority target inside detection radius."""
@@ -156,30 +193,33 @@ class Turret:
     def update(self, dt: float, targets: Iterable[Target]) -> Optional[str]:
         """Advance simulation and return target id if fired."""
         state = self.state
+        previous_heat = state.heat
         state.cooldown = max(0.0, state.cooldown - dt)
         state.heat = max(0.0, state.heat - self.config.heat_dissipation_rate * dt)
+        if not math.isclose(previous_heat, state.heat):
+            self._notify_heat_feedback()
         cooled_this_tick = False
         if state.overheated and state.heat <= self.config.heat_resume_threshold:
             state.overheated = False
             cooled_this_tick = True
+            self._notify_heat_feedback()
+        if self.config.power_capacity > 0:
+            previous_power = state.power
+            state.power = min(
+                self.config.power_capacity,
+                state.power + self.config.power_recharge_rate * dt,
+            )
+            if self.config.power_feedback and not math.isclose(previous_power, state.power):
+                self.config.power_feedback(state.power, self.config.power_capacity)
         targets_list = list(targets)
 
         if state.manual_override:
             state.tracked_target = None
             state.time_since_seen = 0.0
             state.last_prediction_time = 0.0
-            self._apply_manual_orientation(dt)
-            if (
-                state.manual_fire_request
-                and state.cooldown <= 0
-                and not state.overheated
-                and not cooled_this_tick
-            ):
-                state.manual_fire_request = False
-                self._apply_heat()
-                state.cooldown = self.config.fire_cooldown
-                return "manual_override"
-            state.manual_fire_request = False
+            manual_result = self._update_manual_override(dt, cooled_this_tick)
+            if manual_result:
+                return manual_result
             return None
 
         # Maintain current target if still valid
@@ -225,11 +265,16 @@ class Turret:
             return None
 
         if self._is_aligned(state.yaw_deg, yaw_deg) and self._is_aligned(state.pitch_deg, pitch_deg):
-            if self.config.obstruction_check and not self.config.obstruction_check(
-                self.position, predicted_position
-            ):
-                return None
+            if self.config.obstruction_check:
+                sample = self._coerce_obstruction_result(
+                    self.config.obstruction_check(self.position, predicted_position)
+                )
+                state.last_obstruction = sample
+                if sample.blocked:
+                    return None
             if cooled_this_tick:
+                return None
+            if not self._consume_power():
                 return None
             state.cooldown = self.config.fire_cooldown
             fired_id = state.tracked_target.id
@@ -272,18 +317,37 @@ class Turret:
         self.state.current_ammunition = next_ammo
         return next_ammo
 
-    def engage_manual_override(self, yaw_deg: float, pitch_deg: float) -> None:
+    def engage_manual_override(
+        self,
+        yaw_deg: float,
+        pitch_deg: float,
+        *,
+        waypoints: Optional[Iterable[ManualWaypoint]] = None,
+    ) -> None:
         yaw, pitch = self._clamp_angles(yaw_deg, pitch_deg)
         self.state.manual_override = True
         self.state.manual_yaw_deg = yaw
         self.state.manual_pitch_deg = pitch
+        self.state.manual_waypoints = list(waypoints or [])
+        self.state.manual_waypoint_timer = 0.0
+        self.state.manual_burst_shots_remaining = 0
+        self.state.manual_burst_cooldown = 0.0
+        self.state.manual_burst_interval = 0.0
 
     def clear_manual_override(self) -> None:
         self.state.manual_override = False
         self.state.manual_fire_request = False
+        self.state.manual_waypoints.clear()
+        self.state.manual_waypoint_timer = 0.0
+        self.state.manual_burst_shots_remaining = 0
+        self.state.manual_burst_cooldown = 0.0
+        self.state.manual_burst_interval = 0.0
 
     def request_manual_fire(self) -> None:
         self.state.manual_fire_request = True
+
+    def queue_manual_waypoint(self, waypoint: ManualWaypoint) -> None:
+        self.state.manual_waypoints.append(waypoint)
 
     def _apply_manual_orientation(self, dt: float) -> None:
         state = self.state
@@ -311,6 +375,7 @@ class Turret:
         state.heat = min(self.config.heat_capacity, state.heat + ammo.heat_per_shot)
         if state.heat >= self.config.overheat_threshold:
             state.overheated = True
+        self._notify_heat_feedback()
 
     def _resolve_ammunition(self, name: Optional[str]) -> AmmunitionType:
         ammo_list = list(self.config.ammunition_types)
@@ -325,6 +390,81 @@ class Turret:
                 return ammo
         raise ValueError(f"Unknown ammunition type '{name}'")
 
+    def _notify_heat_feedback(self) -> None:
+        if self.config.heat_feedback:
+            self.config.heat_feedback(
+                self.state.heat,
+                self.config.heat_capacity,
+                self.state.overheated,
+            )
+
+    def _consume_power(self) -> bool:
+        if self.config.power_capacity <= 0 or self.config.power_per_shot <= 0:
+            return True
+        if self.state.power + 1e-6 < self.config.power_per_shot:
+            return False
+        self.state.power -= self.config.power_per_shot
+        if self.config.power_feedback:
+            self.config.power_feedback(self.state.power, self.config.power_capacity)
+        return True
+
+    def _coerce_obstruction_result(
+        self, result: Union[bool, ObstructionSample]
+    ) -> ObstructionSample:
+        if isinstance(result, ObstructionSample):
+            return result
+        return ObstructionSample(blocked=not result)
+
+    def _update_manual_override(self, dt: float, cooled_this_tick: bool) -> Optional[str]:
+        state = self.state
+        if state.manual_waypoints:
+            current = state.manual_waypoints[0]
+            yaw, pitch = self._clamp_angles(current.yaw_deg, current.pitch_deg)
+            state.manual_yaw_deg = yaw
+            state.manual_pitch_deg = pitch
+            if self._is_aligned(state.yaw_deg, yaw) and self._is_aligned(state.pitch_deg, pitch):
+                state.manual_waypoint_timer += dt
+                if current.fire_burst > 0 and state.manual_burst_shots_remaining == 0:
+                    state.manual_burst_shots_remaining = current.fire_burst
+                    state.manual_burst_interval = current.burst_interval
+                    state.manual_burst_cooldown = 0.0
+                if state.manual_waypoint_timer >= current.dwell_time:
+                    state.manual_waypoint_timer = 0.0
+                    state.manual_waypoints.pop(0)
+                    state.manual_burst_shots_remaining = 0
+                    state.manual_burst_cooldown = 0.0
+                    state.manual_burst_interval = 0.0
+            else:
+                state.manual_waypoint_timer = 0.0
+        self._apply_manual_orientation(dt)
+        state.manual_burst_cooldown = max(0.0, state.manual_burst_cooldown - dt)
+        if state.cooldown > 0 or state.overheated or cooled_this_tick:
+            state.manual_fire_request = False
+            return None
+        if state.manual_fire_request and self._is_aligned(state.yaw_deg, state.manual_yaw_deg) and self._is_aligned(state.pitch_deg, state.manual_pitch_deg):
+            if not self._consume_power():
+                state.manual_fire_request = False
+                return None
+            state.manual_fire_request = False
+            self._apply_heat()
+            state.cooldown = self.config.fire_cooldown
+            return "manual_override"
+        state.manual_fire_request = False
+        if (
+            state.manual_burst_shots_remaining > 0
+            and state.manual_burst_cooldown <= 0
+            and self._is_aligned(state.yaw_deg, state.manual_yaw_deg)
+            and self._is_aligned(state.pitch_deg, state.manual_pitch_deg)
+        ):
+            if not self._consume_power():
+                return None
+            state.manual_burst_shots_remaining -= 1
+            state.manual_burst_cooldown = state.manual_burst_interval
+            self._apply_heat()
+            state.cooldown = self.config.fire_cooldown
+            return "manual_override_burst"
+        return None
+
 
 __all__ = [
     "AmmunitionType",
@@ -332,6 +472,8 @@ __all__ = [
     "Turret",
     "TurretConfig",
     "TurretState",
+    "ManualWaypoint",
+    "ObstructionSample",
     "Vector3",
     "UP",
 ]
