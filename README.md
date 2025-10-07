@@ -13,6 +13,7 @@ An STS 3D-inspired turret controller featuring predictive aiming, cover awarenes
 - Obstruction metadata hooks that can drive spatial audio occlusion, impact effects, or navmesh costs.
 - Orientation blending so turret aim can be layered with character rigs or IK solvers.
 - Telemetry streaming suitable for dashboards, profilers, or remote debugging tools.
+- Idle scanning, manual override waypoint queues, and scripted burst-fire behaviours for cinematic or player-directed control.
 - Lightweight vector math utilities, simulation CLI, and comprehensive unit tests.
 
 ## Getting started
@@ -20,6 +21,17 @@ An STS 3D-inspired turret controller featuring predictive aiming, cover awarenes
 The project targets **Python 3.11+**.
 
 1. Create and activate a virtual environment, then install development dependencies:
+This repository implements a lightweight STS 3D-inspired turret AI. It provides:
+
+- Core turret logic with target selection, predictive intercept aiming, and firing heuristics.
+- A simple command line simulation to visualise behaviour and real-time predictions.
+- Automated tests covering key interactions.
+
+## Getting started
+
+The project uses Python 3.11+.
+
+1. Create a virtual environment and install dependencies (only `pytest` for tests).
 
    ```bash
    python -m venv .venv
@@ -28,12 +40,14 @@ The project targets **Python 3.11+**.
    ```
 
 2. Run the interactive simulation demo:
+2. Run the demo simulation:
 
    ```bash
    python -m src.simulate
    ```
 
 3. Execute the automated tests:
+3. Execute the test suite:
 
    ```bash
    pytest
@@ -47,6 +61,8 @@ The project targets **Python 3.11+**.
 | `src/turret_ai/turret.py` | Turret controller implementation with ammunition, heat, power, obstruction, and override systems. |
 | `src/simulate.py` | CLI simulation that visualises tracking, allied designations, rig blending, spatial occlusion, ammunition cycling, and feedback hooks. |
 | `tests/` | Pytest suite covering predictive aiming, manual overrides, obstruction checks, heat throttling, telemetry, and ammunition flow. |
+| `src/simulate.py` | CLI simulation that visualises tracking, obstruction sampling, ammunition cycling, and heat feedback hooks. |
+| `tests/` | Pytest suite covering predictive aiming, manual overrides, obstruction checks, heat throttling, and ammunition flow. |
 
 ## Configuration highlights
 
@@ -75,6 +91,40 @@ Important knobs on `TurretConfig`:
 - Train reinforcement-learning agents on the telemetry stream to optimise ammunition usage or prioritisation heuristics.
 - Export telemetry over WebSockets or game-specific RPC to integrate with external analytics suites.
 
+## Extensibility ideas
+
+- Integrate cooperative target designations or threat scoring from allied sensors.
+- Feed obstruction metadata into spatial audio occlusion or impact effects.
+- Blend turret orientation with animation rigs or IK solvers for character-driven platforms.
+- Surface telemetry to external monitoring or debugging dashboards.
+
 ## License
 
 This project is provided for demonstration purposes; adapt or extend it to match your game's licensing needs.
+## Project structure
+
+- `src/turret_ai/geometry.py` – minimal 3D vector helpers.
+- `src/turret_ai/turret.py` – turret controller and AI logic, including lead prediction and configurable cooldowns.
+- `src/simulate.py` – command line simulation demonstrating the turret.
+- `tests/` – unit tests.
+
+## Configuration highlights
+
+Key tuning parameters on `TurretConfig`:
+
+- `max_turn_rate_deg`: constrain how quickly yaw and pitch respond.
+- `fire_arc_deg`: allowable misalignment before firing.
+- `projectile_speed`: used alongside target velocity to compute intercept points.
+- `max_prediction_time`: cap on lead prediction to avoid chasing very distant solutions.
+- `fire_cooldown`: configurable cadence between shots.
+
+## Feature ideas
+
+The turret is intentionally modular so it can be extended. Some additions to
+consider:
+
+- Add obstruction checks (e.g. ray casting) so the turret respects cover.
+- Support multiple ammunition types with different projectile speeds and damage.
+- Introduce heat or power management systems that throttle firing cadence under sustained use.
+- Layer additional behaviours such as idle scanning animations or manual override controls.
+

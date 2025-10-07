@@ -11,6 +11,12 @@ from src.turret_ai.turret import (
     TurretConfig,
     TurretTelemetry,
 )
+    Target,
+    Turret,
+    TurretConfig,
+)
+from turret_ai.geometry import Vector3, solve_intercept_time
+from turret_ai.turret import Target, Turret, TurretConfig
 
 
 def test_target_selection_prefers_priority():
@@ -52,6 +58,10 @@ def test_turret_leads_moving_target():
     )
     config.ammunition_types = (
         AmmunitionType("standard", projectile_speed=45.0, damage=10.0),
+    )
+        projectile_speed=45.0,
+        fire_cooldown=0.05,
+        max_prediction_time=5.0,
     )
     turret = Turret(position=Vector3(0, 0, 0), config=config)
     moving = Target("runner", Vector3(-10, 0, 40), Vector3(8, 0, -6))

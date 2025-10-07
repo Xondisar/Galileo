@@ -17,6 +17,9 @@ __all__ = [
     "ManualWaypoint",
     "ObstructionSample",
     "TargetDesignation",
+from .turret import Target, Turret, TurretConfig, TurretState
+
+__all__ = [
     "Target",
     "Turret",
     "TurretConfig",

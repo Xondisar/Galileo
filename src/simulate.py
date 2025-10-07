@@ -23,6 +23,18 @@ from src.turret_ai.turret import (
     TurretConfig,
     TurretTelemetry,
 )
+    Target,
+    Turret,
+    TurretConfig,
+)
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import List
+
+from turret_ai.geometry import Vector3
+from turret_ai.turret import Target, Turret
 
 
 @dataclass
@@ -78,6 +90,9 @@ class TurretSimulation:
         self.telemetry_overlay: str = ""
         self.sensor_ping_interval = 1.5
         self.next_sensor_ping = 2.0
+        self.turret = Turret(position=Vector3(0.0, 0.0, 0.0))
+        self.targets: List[SimulationTarget] = []
+        self.time = 0.0
 
     def spawn_target(self, identifier: str) -> None:
         position = Vector3(
@@ -160,6 +175,10 @@ class TurretSimulation:
             f" ammo={ammo.name:8s} heat={self.turret.state.heat:4.1f}"
             f" power={self.turret.state.power:4.1f}/{self.turret.config.power_capacity:4.1f}"
         )
+        fired_at = self.turret.update(dt, (t.target for t in self.targets))
+        yaw = self.turret.state.yaw_deg
+        pitch = self.turret.state.pitch_deg
+        status = f"time={self.time:4.1f}s yaw={yaw:6.1f} pitch={pitch:5.1f}"
         if self.turret.state.tracked_target:
             prediction = self.turret.state.last_prediction_time
             status += f" tracking={self.turret.state.tracked_target.id}"
@@ -278,6 +297,9 @@ class TurretSimulation:
         if telemetry.obstruction and telemetry.obstruction.blocked:
             overlay += " occluded"
         self.telemetry_overlay = overlay
+        if fired_at:
+            status += f" -> Fired at target {fired_at}!"
+        print(status)
 
 
 def main() -> None:
