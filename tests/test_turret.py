@@ -1,7 +1,7 @@
 import math
 
-from turret_ai.geometry import Vector3, solve_intercept_time
-from turret_ai.turret import (
+from src.turret_ai.geometry import Vector3, solve_intercept_time
+from src.turret_ai.turret import (
     AmmunitionType,
     ManualWaypoint,
     ObstructionSample,

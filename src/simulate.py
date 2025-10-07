@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import math
 import random
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple
 
-from turret_ai.geometry import Vector3
-from turret_ai.turret import (
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from src.turret_ai.geometry import Vector3
+from src.turret_ai.turret import (
     AmmunitionType,
     ManualWaypoint,
     ObstructionSample,
