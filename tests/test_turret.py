@@ -50,9 +50,9 @@ def test_turret_leads_moving_target():
         max_turn_rate_deg=720.0,
         fire_cooldown=0.05,
         max_prediction_time=5.0,
-    )
-    config.ammunition_types = (
-        AmmunitionType("standard", projectile_speed=45.0, damage=10.0),
+        ammunition_types=(
+            AmmunitionType("standard", projectile_speed=45.0, damage=10.0),
+        ),
     )
     turret = Turret(position=Vector3(0, 0, 0), config=config)
     moving = Target("runner", Vector3(-10, 0, 40), Vector3(8, 0, -6))
