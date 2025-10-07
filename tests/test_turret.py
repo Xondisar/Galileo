@@ -1,5 +1,6 @@
 import math
 
+from src.turret_ai.exporters import CaptureOverlayTelemetryExporter
 from src.turret_ai.geometry import Vector3, solve_intercept_time
 from src.turret_ai.turret import (
     AmmunitionType,
@@ -430,4 +431,232 @@ def test_telemetry_callback_records_firing():
     assert samples
     assert any(isinstance(sample, TurretTelemetry) for sample in samples)
     assert any(sample.fired_target == "telemetry" for sample in samples)
+
+
+def test_cooperative_designations_decay_per_sensor():
+    turret = Turret(position=Vector3(0, 0, 0))
+    turret.ingest_designations(
+        [
+            TargetDesignation(
+                target_id="enemy",
+                threat=5.0,
+                ttl=3.0,
+                sensor_id="radar-alpha",
+                sensor_kind="radar",
+                decay_rate=0.5,
+            ),
+            TargetDesignation(
+                target_id="enemy",
+                threat=3.0,
+                ttl=1.0,
+                sensor_id="drone-beta",
+                sensor_kind="drone",
+                decay_rate=2.5,
+            ),
+        ]
+    )
+
+    turret.update(0.5, [])
+    designation = turret.state.cooperative_designations["enemy"]
+    breakdown = designation.sensor_breakdown()
+    assert breakdown["radar"] > breakdown["drone"]
+
+    turret.update(1.0, [])
+    designation = turret.state.cooperative_designations.get("enemy")
+    assert designation is not None
+    assert "drone-beta" not in designation.contributions
+    assert "radar-alpha" in designation.contributions
+
+    turret.update(2.0, [])
+    assert "enemy" not in turret.state.cooperative_designations
+
+
+def test_effects_callback_receives_obstruction_and_firing_data():
+    captured: list[TurretTelemetry] = []
+
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        obstruction_check=lambda origin, target: ObstructionSample(
+            blocked=False, hit_position=Vector3(0, 0, 5)
+        ),
+        effects_callback=lambda telemetry: captured.append(telemetry),
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("fx", Vector3(0, 0, 18), Vector3(0, 0, 0))
+    turret.state.tracked_target = target
+
+    fired = None
+    for _ in range(20):
+        fired = turret.update(0.1, [target])
+        if fired:
+            break
+
+    assert fired == "fx"
+    assert captured
+    assert any(sample.fired_target == "fx" for sample in captured)
+    assert any(sample.obstruction is not None for sample in captured)
+
+
+def test_rl_training_callback_receives_features():
+    captured: list[tuple[TurretTelemetry, dict[str, float]]] = []
+
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        rl_training_callback=lambda telemetry, features: captured.append(
+            (telemetry, features)
+        ),
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("rl", Vector3(0, 0, 18), Vector3(0, 0, 0))
+    turret.state.tracked_target = target
+
+    for _ in range(5):
+        turret.update(0.1, [target])
+
+    assert captured
+    telemetry, features = captured[-1]
+    assert isinstance(telemetry, TurretTelemetry)
+    assert "heat_ratio" in features
+    assert "cooperative_threat" in features
+    assert "ammo_damage" in features
+
+
+def test_telemetry_exporter_invoked():
+    class DummyExporter:
+        def __init__(self) -> None:
+            self.frames: list[TurretTelemetry] = []
+
+        def send(self, telemetry: TurretTelemetry) -> None:
+            self.frames.append(telemetry)
+
+        def close(self) -> None:
+            return None
+
+    exporter = DummyExporter()
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        telemetry_exporter=exporter,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+
+    turret.update(0.1, [])
+
+    assert exporter.frames
+
+
+def test_cooperative_weighting_uses_confidence_and_latency():
+    config = TurretConfig(
+        cooperative_latency_decay=1.0,
+        cooperative_confidence_exponent=1.0,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    turret.ingest_designations(
+        [
+            TargetDesignation(
+                target_id="enemy",
+                threat=10.0,
+                ttl=3.0,
+                sensor_id="radar-1",
+                sensor_kind="radar",
+                confidence=0.95,
+                latency=0.05,
+            ),
+            TargetDesignation(
+                target_id="enemy",
+                threat=6.0,
+                ttl=3.0,
+                sensor_id="drone-1",
+                sensor_kind="drone",
+                confidence=0.5,
+                latency=1.0,
+            ),
+        ]
+    )
+
+    total, breakdown, count, avg_conf, avg_lat = turret._gather_designation_stats()
+    assert count == 2
+    expected = 10.0 * 0.95 * math.exp(-0.05) + 6.0 * 0.5 * math.exp(-1.0)
+    assert math.isclose(total, expected, rel_tol=1e-4)
+    assert math.isclose(breakdown["radar"], 10.0 * 0.95 * math.exp(-0.05), rel_tol=1e-4)
+    assert avg_conf > 0.0
+    assert avg_lat > 0.0
+
+
+def test_telemetry_capture_callback_provides_frame_index():
+    captures: list[tuple[TurretTelemetry, int]] = []
+
+    def capture_callback(telemetry: TurretTelemetry, frame: int) -> None:
+        captures.append((telemetry, frame))
+
+    config = TurretConfig(
+        telemetry_capture_callback=capture_callback,
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+
+    for _ in range(3):
+        turret.update(0.1, [])
+
+    assert len(captures) == 3
+    assert [frame for _, frame in captures] == [0, 1, 2]
+
+
+def test_rl_reward_adjusts_cooldown_and_bias():
+    config = TurretConfig(
+        fire_cooldown=0.2,
+        rl_reward_target=0.0,
+        rl_reward_adjust_rate=0.5,
+        rl_reward_smoothing=0.0,
+        rl_cooldown_bounds=(0.4, 1.5),
+        rl_threat_bias_bounds=(0.5, 2.0),
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+
+    baseline_cooldown = turret._current_fire_cooldown()
+    turret.apply_rl_reward(1.0)
+    assert turret.state.rl_cooldown_scale < 1.0
+    assert turret.state.rl_threat_bias > 1.0
+    faster_cooldown = turret._current_fire_cooldown()
+    assert faster_cooldown < baseline_cooldown
+
+    turret.apply_rl_reward(-3.0)
+    assert turret.state.rl_cooldown_scale > 1.0
+    assert turret.state.rl_threat_bias < 1.0
+
+
+def test_capture_overlay_exporter_streams_frames():
+    frames: list[tuple[int, dict]] = []
+
+    exporter = CaptureOverlayTelemetryExporter(frames.append)
+    telemetry = TurretTelemetry(
+        time=0.0,
+        yaw_deg=0.0,
+        pitch_deg=0.0,
+        heat=0.0,
+        overheated=False,
+        power=0.0,
+        power_capacity=0.0,
+        tracked_target=None,
+        prediction_time=0.0,
+        ammunition=None,
+        cooldown=0.0,
+        fired_target=None,
+        manual_override=False,
+        obstruction=None,
+        cooperative_designation_count=0,
+        cooperative_threat_score=0.0,
+    )
+
+    exporter.send(telemetry)
+    exporter.send(telemetry)
+
+    assert frames[0][0] == 0
+    assert frames[1][0] == 1
 

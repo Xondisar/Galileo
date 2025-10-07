@@ -1,5 +1,11 @@
 """Turret AI package exposing the main control classes."""
 from .geometry import Vector3, UP, solve_intercept_time
+from .exporters import (
+    CaptureOverlayTelemetryExporter,
+    RpcTelemetryExporter,
+    TelemetryExporter,
+    WebSocketTelemetryExporter,
+)
 from .turret import (
     AmmunitionType,
     ManualWaypoint,
@@ -28,5 +34,9 @@ __all__ = [
     "Vector3",
     "UP",
     "solve_intercept_time",
+    "TelemetryExporter",
+    "WebSocketTelemetryExporter",
+    "RpcTelemetryExporter",
+    "CaptureOverlayTelemetryExporter",
 ]
 
