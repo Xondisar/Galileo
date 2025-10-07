@@ -3,6 +3,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+from typing import TYPE_CHECKING
+
+from .geometry import Vector3, UP, solve_intercept_time
+
+if TYPE_CHECKING:  # pragma: no cover - used only for type checking
+    from .exporters import TelemetryExporter
+
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from typing import Callable, Iterable, List, Optional, Sequence, Union
 from typing import Iterable, List, Optional, Sequence
@@ -67,6 +84,22 @@ class TurretConfig:
     obstruction_feedback: Optional[Callable[["ObstructionSample"], None]] = None
     orientation_blend: Optional[Callable[[float, float], Tuple[float, float]]] = None
     cooperative_threat_weight: float = 1.0
+    cooperative_latency_decay: float = 0.5
+    cooperative_confidence_exponent: float = 1.0
+    telemetry_callback: Optional[Callable[["TurretTelemetry"], None]] = None
+    effects_callback: Optional[Callable[["TurretTelemetry"], None]] = None
+    rl_training_callback: Optional[
+        Callable[["TurretTelemetry", Dict[str, float]], None]
+    ] = None
+    telemetry_exporter: Optional["TelemetryExporter"] = None
+    telemetry_capture_callback: Optional[
+        Callable[["TurretTelemetry", int], None]
+    ] = None
+    rl_reward_target: float = 0.0
+    rl_reward_adjust_rate: float = 0.05
+    rl_reward_smoothing: float = 0.2
+    rl_cooldown_bounds: Tuple[float, float] = (0.5, 1.5)
+    rl_threat_bias_bounds: Tuple[float, float] = (0.5, 2.0)
     telemetry_callback: Optional[Callable[["TurretTelemetry"], None]] = None
 
 
@@ -88,6 +121,55 @@ class TargetDesignation:
     threat: float
     ttl: float = 2.0
     sensor_id: Optional[str] = None
+    sensor_kind: str = "generic"
+    decay_rate: Optional[float] = None
+    confidence: float = 1.0
+    latency: float = 0.0
+
+
+@dataclass
+class _SensorContribution:
+    threat: float
+    time_remaining: float
+    decay_rate: float
+    sensor_kind: str
+    confidence: float
+    confidence_weight: float
+    latency: float
+    latency_weight: float
+
+    def decay(self, dt: float) -> None:
+        self.time_remaining -= dt
+        self.threat = max(0.0, self.threat - self.decay_rate * dt)
+
+    @property
+    def expired(self) -> bool:
+        return self.time_remaining <= 0.0 or self.threat <= 1e-3
+
+    def effective_threat(self) -> float:
+        return max(0.0, self.threat) * self.confidence_weight * self.latency_weight
+
+
+@dataclass
+class _AggregatedDesignation:
+    contributions: Dict[str, _SensorContribution] = field(default_factory=dict)
+
+    def total_threat(self) -> float:
+        return sum(
+            contribution.effective_threat()
+            for contribution in self.contributions.values()
+        )
+
+    def sensor_breakdown(self) -> Dict[str, float]:
+        breakdown: Dict[str, float] = {}
+        for contribution in self.contributions.values():
+            effective = contribution.effective_threat()
+            if effective <= 0:
+                continue
+            breakdown[contribution.sensor_kind] = breakdown.get(
+                contribution.sensor_kind, 0.0
+            ) + effective
+        return breakdown
 
 
 @dataclass
@@ -116,6 +198,10 @@ class TurretTelemetry:
     manual_override: bool
     obstruction: Optional[ObstructionSample]
     cooperative_designation_count: int
+    cooperative_threat_score: float
+    cooperative_sensor_breakdown: Dict[str, float] = field(default_factory=dict)
+    cooperative_average_confidence: float = 0.0
+    cooperative_average_latency: float = 0.0
 
 
 @dataclass
@@ -152,6 +238,15 @@ class TurretState:
     manual_burst_interval: float = 0.0
     power: float = 0.0
     last_obstruction: Optional[ObstructionSample] = None
+    cooperative_designations: Dict[str, _AggregatedDesignation] = field(
+        default_factory=dict
+    )
+    designation_sequence: int = 0
+    total_time: float = 0.0
+    rl_cooldown_scale: float = 1.0
+    rl_threat_bias: float = 1.0
+    rl_reward_trace: float = 0.0
+    capture_frame_index: int = 0
     cooperative_designations: Dict[str, _ActiveDesignation] = field(default_factory=dict)
     total_time: float = 0.0
 
@@ -181,6 +276,11 @@ class Turret:
         self.state.current_ammunition = selected
         if self.config.power_capacity > 0:
             self.state.power = self.config.power_capacity
+        cd_min, cd_max = self.config.rl_cooldown_bounds
+        bias_min, bias_max = self.config.rl_threat_bias_bounds
+        self.state.rl_cooldown_scale = self._clamp_value(1.0, cd_min, cd_max)
+        self.state.rl_threat_bias = self._clamp_value(1.0, bias_min, bias_max)
+        self.state.rl_reward_trace = self.config.rl_reward_target
 
     def select_target(self, candidates: Iterable[Target]) -> Optional[Target]:
         """Pick the highest priority target inside detection radius."""
@@ -195,6 +295,14 @@ class Turret:
 
         def sort_key(t: Target) -> tuple[float, float]:
             designation = self.state.cooperative_designations.get(t.id)
+            threat = designation.total_threat() if designation else 0.0
+            score = t.priority + (
+                self.config.cooperative_threat_weight
+                * self.state.rl_threat_bias
+                * threat
+            )
+            # Higher score first, closer distance preferred
+            return (-score, self.position.distance_to(t.position))
             threat = designation.threat if designation else 0.0
             score = t.priority + self.config.cooperative_threat_weight * threat
             # Higher score first, closer distance preferred
@@ -210,6 +318,13 @@ class Turret:
         yaw = (yaw + 180.0) % 360.0 - 180.0
         return yaw, pitch
 
+    @staticmethod
+    def _clamp_value(value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
+
+    def _compute_desired_angles(
+        self, position: Vector3, projectile_speed: float
+    ) -> tuple[float, float, float]:
     def _compute_desired_angles(
         self, position: Vector3, projectile_speed: float
     ) -> tuple[float, float, float]:
@@ -366,6 +481,8 @@ class Turret:
                 return None
             if not self._consume_power():
                 self._emit_telemetry(None)
+                return None
+            state.cooldown = self._current_fire_cooldown()
                 if sample.blocked:
                     return None
             if cooled_this_tick:
@@ -398,6 +515,14 @@ class Turret:
     def _is_aligned(self, current: float, target: float) -> bool:
         delta = abs((target - current + 180.0) % 360.0 - 180.0)
         return delta <= self.config.fire_arc_deg
+
+    def _current_fire_cooldown(self) -> float:
+        base = self.config.fire_cooldown
+        if base <= 0:
+            return 0.0
+        scale = max(0.0, self.state.rl_cooldown_scale)
+        cooldown = base * scale
+        return max(0.01, cooldown)
 
     @property
     def current_ammunition(self) -> AmmunitionType:
@@ -559,6 +684,7 @@ class Turret:
                 return None
             state.manual_fire_request = False
             self._apply_heat()
+            state.cooldown = self._current_fire_cooldown()
             state.cooldown = self.config.fire_cooldown
             return "manual_override"
         state.manual_fire_request = False
@@ -573,6 +699,7 @@ class Turret:
             state.manual_burst_shots_remaining -= 1
             state.manual_burst_cooldown = state.manual_burst_interval
             self._apply_heat()
+            state.cooldown = self._current_fire_cooldown()
             state.cooldown = self.config.fire_cooldown
             return "manual_override_burst"
         return None
@@ -583,6 +710,34 @@ class Turret:
         for designation in designations:
             if designation.threat <= 0 or designation.ttl <= 0:
                 continue
+            container = self.state.cooperative_designations.setdefault(
+                designation.target_id, _AggregatedDesignation()
+            )
+            sensor_key = designation.sensor_id
+            if sensor_key is None:
+                sensor_key = f"sensor-{self.state.designation_sequence}"
+                self.state.designation_sequence += 1
+            confidence = max(0.0, min(1.0, designation.confidence))
+            exponent = max(1e-3, self.config.cooperative_confidence_exponent)
+            confidence_weight = confidence ** exponent
+            latency = max(0.0, designation.latency)
+            decay_factor = max(0.0, self.config.cooperative_latency_decay)
+            latency_weight = math.exp(-latency * decay_factor) if decay_factor > 0 else 1.0
+            if confidence_weight <= 0 or latency_weight <= 0:
+                continue
+            ttl = max(1e-3, designation.ttl - latency)
+            decay_rate = designation.decay_rate
+            if decay_rate is None:
+                decay_rate = designation.threat / ttl
+            container.contributions[sensor_key] = _SensorContribution(
+                threat=designation.threat,
+                time_remaining=ttl,
+                decay_rate=decay_rate,
+                sensor_kind=designation.sensor_kind,
+                confidence=confidence,
+                confidence_weight=confidence_weight,
+                latency=latency,
+                latency_weight=latency_weight,
             self.state.cooperative_designations[designation.target_id] = _ActiveDesignation(
                 threat=designation.threat,
                 time_remaining=designation.ttl,
@@ -592,6 +747,18 @@ class Turret:
     def _decay_designations(self, dt: float) -> None:
         if not self.state.cooperative_designations:
             return
+        expired_targets: List[str] = []
+        for target_id, designation in self.state.cooperative_designations.items():
+            expired_contributors: List[str] = []
+            for sensor_id, contribution in designation.contributions.items():
+                contribution.decay(dt)
+                if contribution.expired:
+                    expired_contributors.append(sensor_id)
+            for sensor_id in expired_contributors:
+                designation.contributions.pop(sensor_id, None)
+            if not designation.contributions:
+                expired_targets.append(target_id)
+        for target_id in expired_targets:
         expired: List[str] = []
         for target_id, designation in self.state.cooperative_designations.items():
             designation.time_remaining -= dt
@@ -611,6 +778,21 @@ class Turret:
             self.config.obstruction_feedback(sample)
 
     def _emit_telemetry(self, fired_target: Optional[str]) -> None:
+        if (
+            not self.config.telemetry_callback
+            and not self.config.telemetry_exporter
+            and not self.config.effects_callback
+            and not self.config.rl_training_callback
+            and not self.config.telemetry_capture_callback
+        ):
+            return
+        (
+            total_threat,
+            sensor_breakdown,
+            contribution_count,
+            avg_confidence,
+            avg_latency,
+        ) = self._gather_designation_stats()
         if not self.config.telemetry_callback:
             return
         telemetry = TurretTelemetry(
@@ -628,6 +810,120 @@ class Turret:
             fired_target=fired_target,
             manual_override=self.state.manual_override,
             obstruction=self.state.last_obstruction,
+            cooperative_designation_count=contribution_count,
+            cooperative_threat_score=total_threat,
+            cooperative_sensor_breakdown=sensor_breakdown,
+            cooperative_average_confidence=avg_confidence,
+            cooperative_average_latency=avg_latency,
+        )
+        if self.config.telemetry_callback:
+            self.config.telemetry_callback(telemetry)
+        if self.config.telemetry_exporter:
+            self.config.telemetry_exporter.send(telemetry)
+        if self.config.effects_callback and (
+            telemetry.fired_target or telemetry.obstruction is not None
+        ):
+            self.config.effects_callback(telemetry)
+        rl_reward = None
+        if self.config.rl_training_callback:
+            rl_reward = self.config.rl_training_callback(
+                telemetry, self._build_rl_feature_vector(telemetry)
+            )
+        if rl_reward is not None:
+            try:
+                reward_value = float(rl_reward)
+            except (TypeError, ValueError):
+                reward_value = None
+            else:
+                if math.isfinite(reward_value):
+                    self.apply_rl_reward(reward_value)
+        if self.config.telemetry_capture_callback:
+            self.config.telemetry_capture_callback(
+                telemetry, self.state.capture_frame_index
+            )
+        self.state.capture_frame_index += 1
+
+    def _gather_designation_stats(
+        self,
+    ) -> tuple[float, Dict[str, float], int, float, float]:
+        total = 0.0
+        breakdown: Dict[str, float] = {}
+        contribution_count = 0
+        confidence_weight = 0.0
+        latency_weight = 0.0
+        for designation in self.state.cooperative_designations.values():
+            for contribution in designation.contributions.values():
+                effective = contribution.effective_threat()
+                if effective <= 0:
+                    continue
+                total += effective
+                contribution_count += 1
+                breakdown[contribution.sensor_kind] = breakdown.get(
+                    contribution.sensor_kind, 0.0
+                ) + effective
+                confidence_weight += contribution.confidence * effective
+                latency_weight += contribution.latency * effective
+        avg_confidence = confidence_weight / total if total > 1e-6 else 0.0
+        avg_latency = latency_weight / total if total > 1e-6 else 0.0
+        return total, breakdown, contribution_count, avg_confidence, avg_latency
+
+    def _build_rl_feature_vector(self, telemetry: TurretTelemetry) -> Dict[str, float]:
+        ammo = self.state.current_ammunition
+        heat_ratio = 0.0
+        if self.config.heat_capacity > 0:
+            heat_ratio = telemetry.heat / self.config.heat_capacity
+        power_ratio = 0.0
+        if telemetry.power_capacity > 0:
+            power_ratio = telemetry.power / telemetry.power_capacity
+        feature_vector: Dict[str, float] = {
+            "heat_ratio": heat_ratio,
+            "power_ratio": power_ratio,
+            "cooldown": telemetry.cooldown,
+            "cooperative_threat": telemetry.cooperative_threat_score,
+            "manual_override": 1.0 if telemetry.manual_override else 0.0,
+            "overheated": 1.0 if telemetry.overheated else 0.0,
+            "rl_cooldown_scale": self.state.rl_cooldown_scale,
+            "rl_threat_bias": self.state.rl_threat_bias,
+            "coop_confidence": telemetry.cooperative_average_confidence,
+            "coop_latency": telemetry.cooperative_average_latency,
+        }
+        if ammo is not None:
+            feature_vector.update(
+                {
+                    "ammo_damage": ammo.damage,
+                    "ammo_heat": ammo.heat_per_shot,
+                    "ammo_speed": ammo.projectile_speed,
+                }
+            )
+        return feature_vector
+
+    def apply_rl_reward(self, reward: float) -> None:
+        if not math.isfinite(reward):
+            return
+        smoothing = max(0.0, min(1.0, self.config.rl_reward_smoothing))
+        if smoothing <= 0 or self.state.total_time <= 0:
+            self.state.rl_reward_trace = reward
+        else:
+            self.state.rl_reward_trace = (
+                (1.0 - smoothing) * self.state.rl_reward_trace
+                + smoothing * reward
+            )
+        adjust = self.config.rl_reward_adjust_rate
+        if adjust <= 0:
+            return
+        delta = self.state.rl_reward_trace - self.config.rl_reward_target
+        cd_min, cd_max = self.config.rl_cooldown_bounds
+        threat_min, threat_max = self.config.rl_threat_bias_bounds
+        self.state.rl_cooldown_scale = self._clamp_value(
+            self.state.rl_cooldown_scale - delta * adjust, cd_min, cd_max
+        )
+        self.state.rl_threat_bias = self._clamp_value(
+            self.state.rl_threat_bias + delta * adjust, threat_min, threat_max
+        )
+
+
+__all__ = [
+    "AmmunitionType",
             cooperative_designation_count=len(self.state.cooperative_designations),
         )
         self.config.telemetry_callback(telemetry)
