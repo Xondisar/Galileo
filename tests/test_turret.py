@@ -2,14 +2,22 @@ import math
 
 from src.turret_ai.exporters import CaptureOverlayTelemetryExporter
 from src.turret_ai.geometry import Vector3, solve_intercept_time
-from src.turret_ai.turret import AmmunitionType
-from src.turret_ai.turret import ManualWaypoint
-from src.turret_ai.turret import ObstructionSample
-from src.turret_ai.turret import Target
-from src.turret_ai.turret import TargetDesignation
-from src.turret_ai.turret import Turret
-from src.turret_ai.turret import TurretConfig
-from src.turret_ai.turret import TurretTelemetry
+from src.turret_ai.turret import (
+    AmmunitionType,
+    ManualWaypoint,
+    ObstructionSample,
+    TargetDesignation,
+    Target,
+    Turret,
+    TurretConfig,
+    TurretTelemetry,
+)
+    Target,
+    Turret,
+    TurretConfig,
+)
+from turret_ai.geometry import Vector3, solve_intercept_time
+from turret_ai.turret import Target, Turret, TurretConfig
 
 
 def test_target_selection_prefers_priority():
@@ -48,9 +56,13 @@ def test_turret_leads_moving_target():
         max_turn_rate_deg=720.0,
         fire_cooldown=0.05,
         max_prediction_time=5.0,
-        ammunition_types=(
-            AmmunitionType("standard", projectile_speed=45.0, damage=10.0),
-        ),
+    )
+    config.ammunition_types = (
+        AmmunitionType("standard", projectile_speed=45.0, damage=10.0),
+    )
+        projectile_speed=45.0,
+        fire_cooldown=0.05,
+        max_prediction_time=5.0,
     )
     turret = Turret(position=Vector3(0, 0, 0), config=config)
     moving = Target("runner", Vector3(-10, 0, 40), Vector3(8, 0, -6))
