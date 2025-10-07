@@ -20,6 +20,12 @@ from .geometry import Vector3, UP, solve_intercept_time
 if TYPE_CHECKING:  # pragma: no cover - used only for type checking
     from .exporters import TelemetryExporter
 
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Sequence, Union
+from typing import Iterable, List, Optional, Sequence
+
+from .geometry import Vector3, UP, solve_intercept_time
+
 
 @dataclass(frozen=True)
 class AmmunitionType:
@@ -94,6 +100,7 @@ class TurretConfig:
     rl_reward_smoothing: float = 0.2
     rl_cooldown_bounds: Tuple[float, float] = (0.5, 1.5)
     rl_threat_bias_bounds: Tuple[float, float] = (0.5, 2.0)
+    telemetry_callback: Optional[Callable[["TurretTelemetry"], None]] = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +172,13 @@ class _AggregatedDesignation:
         return breakdown
 
 
+@dataclass
+class _ActiveDesignation:
+    threat: float
+    time_remaining: float
+    sensor_id: Optional[str] = None
+
+
 @dataclass(frozen=True)
 class TurretTelemetry:
     """Snapshot of the turret state for external dashboards."""
@@ -233,6 +247,8 @@ class TurretState:
     rl_threat_bias: float = 1.0
     rl_reward_trace: float = 0.0
     capture_frame_index: int = 0
+    cooperative_designations: Dict[str, _ActiveDesignation] = field(default_factory=dict)
+    total_time: float = 0.0
 
 
 @dataclass
@@ -287,6 +303,13 @@ class Turret:
             )
             # Higher score first, closer distance preferred
             return (-score, self.position.distance_to(t.position))
+            threat = designation.threat if designation else 0.0
+            score = t.priority + self.config.cooperative_threat_weight * threat
+            # Higher score first, closer distance preferred
+            return (-score, self.position.distance_to(t.position))
+        def sort_key(t: Target) -> tuple[int, float]:
+            # Higher priority first, closer distance preferred
+            return (-t.priority, self.position.distance_to(t.position))
 
         return min(in_range, key=sort_key)
 
@@ -302,6 +325,10 @@ class Turret:
     def _compute_desired_angles(
         self, position: Vector3, projectile_speed: float
     ) -> tuple[float, float, float]:
+    def _compute_desired_angles(
+        self, position: Vector3, projectile_speed: float
+    ) -> tuple[float, float, float]:
+    def _compute_desired_angles(self, position: Vector3) -> tuple[float, float, float]:
         """Return desired yaw, pitch (in degrees) and time to impact."""
         offset = position - self.position
         distance = offset.magnitude()
@@ -314,11 +341,16 @@ class Turret:
         return math.degrees(yaw_rad), math.degrees(pitch_rad), time_to_target
 
     def _predict_intercept(self, target: Target, projectile_speed: float) -> tuple[Vector3, float]:
+        time_to_target = distance / self.config.projectile_speed if self.config.projectile_speed else 0.0
+        return math.degrees(yaw_rad), math.degrees(pitch_rad), time_to_target
+
+    def _predict_intercept(self, target: Target) -> tuple[Vector3, float]:
         intercept_time = solve_intercept_time(
             origin=self.position,
             target_position=target.position,
             target_velocity=target.velocity,
             projectile_speed=projectile_speed,
+            projectile_speed=self.config.projectile_speed,
             max_time=self.config.max_prediction_time,
         )
         predicted_position = target.predict_position(intercept_time)
@@ -364,6 +396,12 @@ class Turret:
             manual_result = self._update_manual_override(dt, cooled_this_tick)
             self._emit_telemetry(manual_result)
             return manual_result
+            if manual_result:
+                return manual_result
+            return None
+
+        state.cooldown = max(0.0, state.cooldown - dt)
+        targets_list = list(targets)
 
         # Maintain current target if still valid
         if state.tracked_target:
@@ -416,6 +454,18 @@ class Turret:
             self._emit_telemetry(None)
             return None
 
+        predicted_position, intercept_time = self._predict_intercept(state.tracked_target)
+        state.last_prediction_time = intercept_time
+        yaw_deg, pitch_deg, _ = self._compute_desired_angles(predicted_position)
+        yaw_deg, pitch_deg = self._clamp_angles(yaw_deg, pitch_deg)
+
+        # Smooth rotation towards desired angles
+        state.yaw_deg = self._approach_angle(state.yaw_deg, yaw_deg, self.config.max_turn_rate_deg * dt)
+        state.pitch_deg = self._approach_angle(state.pitch_deg, pitch_deg, self.config.max_turn_rate_deg * dt)
+
+        if state.cooldown > 0 or state.overheated:
+            return None
+
         if self._is_aligned(state.yaw_deg, yaw_deg) and self._is_aligned(state.pitch_deg, pitch_deg):
             if self.config.obstruction_check:
                 sample = self._coerce_obstruction_result(
@@ -433,12 +483,27 @@ class Turret:
                 self._emit_telemetry(None)
                 return None
             state.cooldown = self._current_fire_cooldown()
+                if sample.blocked:
+                    return None
+            if cooled_this_tick:
+                return None
+            if not self._consume_power():
+                return None
+            state.cooldown = self.config.fire_cooldown
             fired_id = state.tracked_target.id
             self._apply_heat()
             self._emit_telemetry(fired_id)
             return fired_id
 
         self._emit_telemetry(None)
+            return fired_id
+        if state.cooldown > 0:
+            return None
+
+        if self._is_aligned(state.yaw_deg, yaw_deg) and self._is_aligned(state.pitch_deg, pitch_deg):
+            state.cooldown = self.config.fire_cooldown
+            return state.tracked_target.id
+
         return None
 
     @staticmethod
@@ -620,6 +685,7 @@ class Turret:
             state.manual_fire_request = False
             self._apply_heat()
             state.cooldown = self._current_fire_cooldown()
+            state.cooldown = self.config.fire_cooldown
             return "manual_override"
         state.manual_fire_request = False
         if (
@@ -634,6 +700,7 @@ class Turret:
             state.manual_burst_cooldown = state.manual_burst_interval
             self._apply_heat()
             state.cooldown = self._current_fire_cooldown()
+            state.cooldown = self.config.fire_cooldown
             return "manual_override_burst"
         return None
 
@@ -671,6 +738,10 @@ class Turret:
                 confidence_weight=confidence_weight,
                 latency=latency,
                 latency_weight=latency_weight,
+            self.state.cooperative_designations[designation.target_id] = _ActiveDesignation(
+                threat=designation.threat,
+                time_remaining=designation.ttl,
+                sensor_id=designation.sensor_id,
             )
 
     def _decay_designations(self, dt: float) -> None:
@@ -688,6 +759,12 @@ class Turret:
             if not designation.contributions:
                 expired_targets.append(target_id)
         for target_id in expired_targets:
+        expired: List[str] = []
+        for target_id, designation in self.state.cooperative_designations.items():
+            designation.time_remaining -= dt
+            if designation.time_remaining <= 0:
+                expired.append(target_id)
+        for target_id in expired:
             self.state.cooperative_designations.pop(target_id, None)
 
     def _apply_orientation_blend(self, yaw: float, pitch: float) -> tuple[float, float]:
@@ -716,6 +793,8 @@ class Turret:
             avg_confidence,
             avg_latency,
         ) = self._gather_designation_stats()
+        if not self.config.telemetry_callback:
+            return
         telemetry = TurretTelemetry(
             time=self.state.total_time,
             yaw_deg=self.state.yaw_deg,
@@ -845,6 +924,18 @@ class Turret:
 
 __all__ = [
     "AmmunitionType",
+            cooperative_designation_count=len(self.state.cooperative_designations),
+        )
+        self.config.telemetry_callback(telemetry)
+
+
+__all__ = [
+    "AmmunitionType",
+
+__all__ = [
+    "AmmunitionType",
+
+__all__ = [
     "Target",
     "Turret",
     "TurretConfig",
