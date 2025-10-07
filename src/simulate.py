@@ -17,6 +17,12 @@ from src.turret_ai.turret import (
     AmmunitionType,
     ManualWaypoint,
     ObstructionSample,
+    TargetDesignation,
+    Target,
+    Turret,
+    TurretConfig,
+    TurretTelemetry,
+)
     Target,
     Turret,
     TurretConfig,
@@ -60,6 +66,10 @@ class TurretSimulation:
             power_per_shot=1.5,
             power_recharge_rate=0.8,
             power_feedback=self._on_power_feedback,
+            obstruction_feedback=self._on_obstruction_feedback,
+            orientation_blend=self._blend_with_rig,
+            cooperative_threat_weight=1.6,
+            telemetry_callback=self._on_telemetry,
         )
         self.turret = Turret(position=Vector3(0.0, 0.0, 0.0), config=config)
         self.cover_objects: List[Tuple[Vector3, float]] = [
@@ -75,6 +85,11 @@ class TurretSimulation:
         self.manual_override_start = 16.0
         self.manual_override_end = 19.0
         self.feedback_events: List[str] = []
+        self.obstruction_events: List[str] = []
+        self.telemetry_log: List[TurretTelemetry] = []
+        self.telemetry_overlay: str = ""
+        self.sensor_ping_interval = 1.5
+        self.next_sensor_ping = 2.0
         self.turret = Turret(position=Vector3(0.0, 0.0, 0.0))
         self.targets: List[SimulationTarget] = []
         self.time = 0.0
@@ -105,6 +120,9 @@ class TurretSimulation:
 
     def step(self, dt: float) -> None:
         self.time += dt
+        while self.time >= self.next_sensor_ping:
+            self._broadcast_designations()
+            self.next_sensor_ping += self.sensor_ping_interval
         # Update target movement
         new_targets: List[SimulationTarget] = []
         for sim_target in self.targets:
@@ -177,11 +195,20 @@ class TurretSimulation:
             status += " | LOS blocked"
             if sample.hit_position:
                 status += f" at {sample.hit_position}"
+        designation_count = len(self.turret.state.cooperative_designations)
+        if designation_count:
+            status += f" | designations={designation_count}"
         if messages:
             status += " | " + ", ".join(messages)
         if self.feedback_events:
             status += " | feedback=" + ", ".join(self.feedback_events)
             self.feedback_events.clear()
+        if self.obstruction_events:
+            status += " | audio=" + ", ".join(self.obstruction_events)
+            self.obstruction_events.clear()
+        if self.telemetry_overlay:
+            status += f" | {self.telemetry_overlay}"
+            self.telemetry_overlay = ""
         print(status)
 
     def _has_line_of_sight(self, origin: Vector3, target: Vector3) -> ObstructionSample:
@@ -208,6 +235,31 @@ class TurretSimulation:
                 return ObstructionSample(blocked=True, hit_position=hit_point, navigation_cost=radius)
         return ObstructionSample(blocked=False, navigation_cost=1.0)
 
+    def _broadcast_designations(self) -> None:
+        if not self.targets:
+            return
+        designations: List[TargetDesignation] = []
+        for sim_target in self.targets:
+            distance = self.turret.position.distance_to(sim_target.target.position)
+            if distance > self.turret.config.detection_radius * 1.3:
+                continue
+            proximity = max(0.0, 1.0 - distance / max(1.0, self.turret.config.detection_radius))
+            airborne_bonus = 0.35 if sim_target.target.is_airborne else 0.0
+            threat = (sim_target.target.priority + 1) * 0.4 + proximity + airborne_bonus
+            if threat <= 0:
+                continue
+            designations.append(
+                TargetDesignation(
+                    target_id=sim_target.target.id,
+                    threat=threat,
+                    ttl=2.5,
+                    sensor_id="allied-radar",
+                )
+            )
+        if designations:
+            self.turret.ingest_designations(designations)
+            self.feedback_events.append(f"allied pings {len(designations)}x")
+
     def _on_heat_feedback(self, heat: float, capacity: float, overheated: bool) -> None:
         state = "overheated" if overheated else "cooling" if heat < capacity * 0.25 else "warm"
         self.feedback_events.append(f"heat {heat:3.1f} ({state})")
@@ -219,6 +271,32 @@ class TurretSimulation:
         level = "low" if ratio < 0.25 else "charging" if ratio < 0.9 else "full"
         self.feedback_events.append(f"power {power:3.1f} ({level})")
 
+    def _on_obstruction_feedback(self, sample: ObstructionSample) -> None:
+        if sample.blocked:
+            descriptor = "occluded"
+            if sample.hit_position:
+                descriptor += f" @{sample.hit_position.z:4.1f}m"
+        else:
+            descriptor = f"clear (cost={sample.navigation_cost:3.1f})"
+        self.obstruction_events.append(descriptor)
+
+    def _blend_with_rig(self, yaw: float, pitch: float) -> tuple[float, float]:
+        sway = math.sin(self.turret.state.total_time * 0.6) * 2.0
+        lift = math.sin(self.turret.state.total_time * 0.85) * 1.0
+        return yaw + sway * 0.25, pitch + lift * 0.15
+
+    def _on_telemetry(self, telemetry: TurretTelemetry) -> None:
+        self.telemetry_log.append(telemetry)
+        if len(self.telemetry_log) > 40:
+            self.telemetry_log.pop(0)
+        overlay = f"telemetry heat={telemetry.heat:3.1f} power={telemetry.power:3.1f}"
+        if telemetry.cooperative_designation_count:
+            overlay += f" coop={telemetry.cooperative_designation_count}"
+        if telemetry.fired_target:
+            overlay += f" fired={telemetry.fired_target}"
+        if telemetry.obstruction and telemetry.obstruction.blocked:
+            overlay += " occluded"
+        self.telemetry_overlay = overlay
         if fired_at:
             status += f" -> Fired at target {fired_at}!"
         print(status)

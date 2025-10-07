@@ -5,6 +5,12 @@ from src.turret_ai.turret import (
     AmmunitionType,
     ManualWaypoint,
     ObstructionSample,
+    TargetDesignation,
+    Target,
+    Turret,
+    TurretConfig,
+    TurretTelemetry,
+)
     Target,
     Turret,
     TurretConfig,
@@ -350,4 +356,78 @@ def test_obstruction_sample_data_respected():
     assert fired == "covered"
     assert turret.state.last_obstruction is not None
     assert not turret.state.last_obstruction.blocked
+
+
+def test_cooperative_designations_influence_selection():
+    turret = Turret(position=Vector3(0, 0, 0))
+    low_priority = Target("low", Vector3(5, 0, 10), Vector3(0, 0, 0), priority=0)
+    high_priority = Target("high", Vector3(4, 0, 8), Vector3(0, 0, 0), priority=2)
+
+    turret.ingest_designations([TargetDesignation(target_id="low", threat=4.0, ttl=3.0)])
+    selected = turret.select_target([low_priority, high_priority])
+
+    assert selected is low_priority
+
+
+def test_obstruction_feedback_callback_receives_sample():
+    received: list[ObstructionSample] = []
+    sample = ObstructionSample(blocked=True, hit_position=Vector3(0, 0, 5))
+
+    config = TurretConfig(
+        fire_arc_deg=2.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        obstruction_check=lambda origin, target: sample,
+        obstruction_feedback=lambda ob: received.append(ob),
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("hidden", Vector3(0, 0, 15), Vector3(0, 0, 0))
+
+    turret.state.tracked_target = target
+    turret.update(0.1, [target])
+
+    assert received and received[0] is sample
+
+
+def test_orientation_blend_adjusts_orientation():
+    def blend(yaw: float, pitch: float) -> tuple[float, float]:
+        return yaw + 10.0, pitch + 5.0
+
+    config = TurretConfig(
+        orientation_blend=blend,
+        max_turn_rate_deg=720.0,
+        fire_arc_deg=10.0,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    turret.engage_manual_override(0.0, 0.0)
+
+    turret.update(0.1, [])
+
+    assert math.isclose(turret.state.yaw_deg, 10.0, abs_tol=1e-3)
+    assert math.isclose(turret.state.pitch_deg, 5.0, abs_tol=1e-3)
+
+
+def test_telemetry_callback_records_firing():
+    samples: list[TurretTelemetry] = []
+
+    config = TurretConfig(
+        fire_arc_deg=5.0,
+        max_turn_rate_deg=720.0,
+        fire_cooldown=0.05,
+        telemetry_callback=samples.append,
+    )
+    turret = Turret(position=Vector3(0, 0, 0), config=config)
+    target = Target("telemetry", Vector3(0, 0, 20), Vector3(0, 0, 0))
+    turret.state.tracked_target = target
+
+    fired = None
+    for _ in range(10):
+        fired = turret.update(0.1, [target])
+        if fired:
+            break
+
+    assert fired == "telemetry"
+    assert samples
+    assert any(isinstance(sample, TurretTelemetry) for sample in samples)
+    assert any(sample.fired_target == "telemetry" for sample in samples)
 

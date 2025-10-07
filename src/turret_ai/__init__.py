@@ -4,16 +4,19 @@ from .turret import (
     AmmunitionType,
     ManualWaypoint,
     ObstructionSample,
+    TargetDesignation,
     Target,
     Turret,
     TurretConfig,
     TurretState,
+    TurretTelemetry,
 )
 
 __all__ = [
     "AmmunitionType",
     "ManualWaypoint",
     "ObstructionSample",
+    "TargetDesignation",
 from .turret import Target, Turret, TurretConfig, TurretState
 
 __all__ = [
@@ -21,6 +24,7 @@ __all__ = [
     "Turret",
     "TurretConfig",
     "TurretState",
+    "TurretTelemetry",
     "Vector3",
     "UP",
     "solve_intercept_time",

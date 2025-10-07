@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from typing import Callable, Iterable, List, Optional, Sequence, Union
 from typing import Iterable, List, Optional, Sequence
 
@@ -63,6 +64,10 @@ class TurretConfig:
     power_per_shot: float = 0.0
     power_recharge_rate: float = 0.0
     power_feedback: Optional[Callable[[float, float], None]] = None
+    obstruction_feedback: Optional[Callable[["ObstructionSample"], None]] = None
+    orientation_blend: Optional[Callable[[float, float], Tuple[float, float]]] = None
+    cooperative_threat_weight: float = 1.0
+    telemetry_callback: Optional[Callable[["TurretTelemetry"], None]] = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,44 @@ class ObstructionSample:
     hit_position: Optional[Vector3] = None
     surface_normal: Optional[Vector3] = None
     navigation_cost: float = 0.0
+
+
+@dataclass
+class TargetDesignation:
+    """Threat data shared by allied sensors."""
+
+    target_id: str
+    threat: float
+    ttl: float = 2.0
+    sensor_id: Optional[str] = None
+
+
+@dataclass
+class _ActiveDesignation:
+    threat: float
+    time_remaining: float
+    sensor_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TurretTelemetry:
+    """Snapshot of the turret state for external dashboards."""
+
+    time: float
+    yaw_deg: float
+    pitch_deg: float
+    heat: float
+    overheated: bool
+    power: float
+    power_capacity: float
+    tracked_target: Optional[str]
+    prediction_time: float
+    ammunition: Optional[str]
+    cooldown: float
+    fired_target: Optional[str]
+    manual_override: bool
+    obstruction: Optional[ObstructionSample]
+    cooperative_designation_count: int
 
 
 @dataclass
@@ -109,6 +152,8 @@ class TurretState:
     manual_burst_interval: float = 0.0
     power: float = 0.0
     last_obstruction: Optional[ObstructionSample] = None
+    cooperative_designations: Dict[str, _ActiveDesignation] = field(default_factory=dict)
+    total_time: float = 0.0
 
 
 @dataclass
@@ -148,6 +193,12 @@ class Turret:
         if not in_range:
             return None
 
+        def sort_key(t: Target) -> tuple[float, float]:
+            designation = self.state.cooperative_designations.get(t.id)
+            threat = designation.threat if designation else 0.0
+            score = t.priority + self.config.cooperative_threat_weight * threat
+            # Higher score first, closer distance preferred
+            return (-score, self.position.distance_to(t.position))
         def sort_key(t: Target) -> tuple[int, float]:
             # Higher priority first, closer distance preferred
             return (-t.priority, self.position.distance_to(t.position))
@@ -200,6 +251,7 @@ class Turret:
     def update(self, dt: float, targets: Iterable[Target]) -> Optional[str]:
         """Advance simulation and return target id if fired."""
         state = self.state
+        state.total_time += dt
         previous_heat = state.heat
         state.cooldown = max(0.0, state.cooldown - dt)
         state.heat = max(0.0, state.heat - self.config.heat_dissipation_rate * dt)
@@ -218,6 +270,8 @@ class Turret:
             )
             if self.config.power_feedback and not math.isclose(previous_power, state.power):
                 self.config.power_feedback(state.power, self.config.power_capacity)
+
+        self._decay_designations(dt)
         targets_list = list(targets)
 
         if state.manual_override:
@@ -225,6 +279,8 @@ class Turret:
             state.time_since_seen = 0.0
             state.last_prediction_time = 0.0
             manual_result = self._update_manual_override(dt, cooled_this_tick)
+            self._emit_telemetry(manual_result)
+            return manual_result
             if manual_result:
                 return manual_result
             return None
@@ -255,6 +311,7 @@ class Turret:
         if state.tracked_target is None:
             self._perform_idle_scan(dt)
             state.last_prediction_time = 0.0
+            self._emit_telemetry(None)
             return None
 
         projectile_speed = self.current_ammunition.projectile_speed
@@ -265,6 +322,21 @@ class Turret:
         yaw_deg, pitch_deg, _ = self._compute_desired_angles(
             predicted_position, projectile_speed
         )
+        yaw_deg, pitch_deg = self._clamp_angles(yaw_deg, pitch_deg)
+
+        # Smooth rotation towards desired angles
+        state.yaw_deg = self._approach_angle(
+            state.yaw_deg, yaw_deg, self.config.max_turn_rate_deg * dt
+        )
+        state.pitch_deg = self._approach_angle(
+            state.pitch_deg, pitch_deg, self.config.max_turn_rate_deg * dt
+        )
+        state.yaw_deg, state.pitch_deg = self._apply_orientation_blend(
+            state.yaw_deg, state.pitch_deg
+        )
+
+        if state.cooldown > 0 or state.overheated:
+            self._emit_telemetry(None)
             return None
 
         predicted_position, intercept_time = self._predict_intercept(state.tracked_target)
@@ -285,6 +357,15 @@ class Turret:
                     self.config.obstruction_check(self.position, predicted_position)
                 )
                 state.last_obstruction = sample
+                self._notify_obstruction_feedback(sample)
+                if sample.blocked:
+                    self._emit_telemetry(None)
+                    return None
+            if cooled_this_tick:
+                self._emit_telemetry(None)
+                return None
+            if not self._consume_power():
+                self._emit_telemetry(None)
                 if sample.blocked:
                     return None
             if cooled_this_tick:
@@ -294,6 +375,10 @@ class Turret:
             state.cooldown = self.config.fire_cooldown
             fired_id = state.tracked_target.id
             self._apply_heat()
+            self._emit_telemetry(fired_id)
+            return fired_id
+
+        self._emit_telemetry(None)
             return fired_id
         if state.cooldown > 0:
             return None
@@ -379,6 +464,9 @@ class Turret:
             max(self.config.min_elevation_deg, min(self.config.max_elevation_deg, state.manual_pitch_deg)),
             yaw_speed,
         )
+        state.yaw_deg, state.pitch_deg = self._apply_orientation_blend(
+            state.yaw_deg, state.pitch_deg
+        )
 
     def _perform_idle_scan(self, dt: float) -> None:
         state = self.state
@@ -389,6 +477,9 @@ class Turret:
         yaw_speed = self.config.max_turn_rate_deg * dt
         state.yaw_deg = self._approach_angle(state.yaw_deg, desired_yaw, yaw_speed)
         state.pitch_deg = self._approach_angle(state.pitch_deg, desired_pitch, yaw_speed)
+        state.yaw_deg, state.pitch_deg = self._apply_orientation_blend(
+            state.yaw_deg, state.pitch_deg
+        )
 
     def _apply_heat(self) -> None:
         state = self.state
@@ -486,6 +577,64 @@ class Turret:
             return "manual_override_burst"
         return None
 
+    def ingest_designations(self, designations: Iterable[TargetDesignation]) -> None:
+        """Accept cooperative target designations from allied sensors."""
+
+        for designation in designations:
+            if designation.threat <= 0 or designation.ttl <= 0:
+                continue
+            self.state.cooperative_designations[designation.target_id] = _ActiveDesignation(
+                threat=designation.threat,
+                time_remaining=designation.ttl,
+                sensor_id=designation.sensor_id,
+            )
+
+    def _decay_designations(self, dt: float) -> None:
+        if not self.state.cooperative_designations:
+            return
+        expired: List[str] = []
+        for target_id, designation in self.state.cooperative_designations.items():
+            designation.time_remaining -= dt
+            if designation.time_remaining <= 0:
+                expired.append(target_id)
+        for target_id in expired:
+            self.state.cooperative_designations.pop(target_id, None)
+
+    def _apply_orientation_blend(self, yaw: float, pitch: float) -> tuple[float, float]:
+        if not self.config.orientation_blend:
+            return yaw, pitch
+        blended_yaw, blended_pitch = self.config.orientation_blend(yaw, pitch)
+        return self._clamp_angles(blended_yaw, blended_pitch)
+
+    def _notify_obstruction_feedback(self, sample: ObstructionSample) -> None:
+        if self.config.obstruction_feedback:
+            self.config.obstruction_feedback(sample)
+
+    def _emit_telemetry(self, fired_target: Optional[str]) -> None:
+        if not self.config.telemetry_callback:
+            return
+        telemetry = TurretTelemetry(
+            time=self.state.total_time,
+            yaw_deg=self.state.yaw_deg,
+            pitch_deg=self.state.pitch_deg,
+            heat=self.state.heat,
+            overheated=self.state.overheated,
+            power=self.state.power,
+            power_capacity=self.config.power_capacity,
+            tracked_target=self.state.tracked_target.id if self.state.tracked_target else None,
+            prediction_time=self.state.last_prediction_time,
+            ammunition=self.state.current_ammunition.name if self.state.current_ammunition else None,
+            cooldown=self.state.cooldown,
+            fired_target=fired_target,
+            manual_override=self.state.manual_override,
+            obstruction=self.state.last_obstruction,
+            cooperative_designation_count=len(self.state.cooperative_designations),
+        )
+        self.config.telemetry_callback(telemetry)
+
+
+__all__ = [
+    "AmmunitionType",
 
 __all__ = [
     "AmmunitionType",
@@ -497,6 +646,8 @@ __all__ = [
     "TurretState",
     "ManualWaypoint",
     "ObstructionSample",
+    "TargetDesignation",
+    "TurretTelemetry",
     "Vector3",
     "UP",
 ]
