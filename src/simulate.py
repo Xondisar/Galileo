@@ -2,12 +2,17 @@ from __future__ import annotations
 
 """Run a small command line simulation showcasing the turret AI."""
 
+"""Run a small command line simulation showcasing the turret AI."""
+
+from __future__ import annotations
+
 import math
 import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -27,6 +32,18 @@ from src.turret_ai.turret import (
     TurretConfig,
     TurretTelemetry,
 )
+    Target,
+    Turret,
+    TurretConfig,
+)
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import List
+
+from turret_ai.geometry import Vector3
+from turret_ai.turret import Target, Turret
 
 
 @dataclass
@@ -92,6 +109,9 @@ class TurretSimulation:
         )
         self.turret = Turret(position=Vector3(0.0, 0.0, 0.0), config=config)
         self.telemetry_exporter = exporter
+            telemetry_callback=self._on_telemetry,
+        )
+        self.turret = Turret(position=Vector3(0.0, 0.0, 0.0), config=config)
         self.cover_objects: List[Tuple[Vector3, float]] = [
             (Vector3(5.0, 0.0, 18.0), 3.5),
             (Vector3(-8.0, 0.0, 25.0), 4.0),
@@ -121,6 +141,9 @@ class TurretSimulation:
         self.capture_events: List[str] = []
         self.capture_stream_events: List[str] = []
         self.pending_reward: Optional[float] = None
+        self.turret = Turret(position=Vector3(0.0, 0.0, 0.0))
+        self.targets: List[SimulationTarget] = []
+        self.time = 0.0
 
     def spawn_target(self, identifier: str) -> None:
         position = Vector3(
@@ -157,6 +180,8 @@ class TurretSimulation:
         while self.time >= self.next_player_ping:
             self._broadcast_designations(("player",))
             self.next_player_ping += self.player_ping_interval
+            self._broadcast_designations()
+            self.next_sensor_ping += self.sensor_ping_interval
         # Update target movement
         new_targets: List[SimulationTarget] = []
         for sim_target in self.targets:
@@ -209,6 +234,10 @@ class TurretSimulation:
             f" ammo={ammo.name:8s} heat={self.turret.state.heat:4.1f}"
             f" power={self.turret.state.power:4.1f}/{self.turret.config.power_capacity:4.1f}"
         )
+        fired_at = self.turret.update(dt, (t.target for t in self.targets))
+        yaw = self.turret.state.yaw_deg
+        pitch = self.turret.state.pitch_deg
+        status = f"time={self.time:4.1f}s yaw={yaw:6.1f} pitch={pitch:5.1f}"
         if self.turret.state.tracked_target:
             prediction = self.turret.state.last_prediction_time
             status += f" tracking={self.turret.state.tracked_target.id}"
@@ -343,6 +372,30 @@ class TurretSimulation:
             self.turret.ingest_designations(designations)
             summary = ", ".join(f"{key}:{value}" for key, value in sensor_counts.items())
             self.designation_events.append(summary)
+    def _broadcast_designations(self) -> None:
+        if not self.targets:
+            return
+        designations: List[TargetDesignation] = []
+        for sim_target in self.targets:
+            distance = self.turret.position.distance_to(sim_target.target.position)
+            if distance > self.turret.config.detection_radius * 1.3:
+                continue
+            proximity = max(0.0, 1.0 - distance / max(1.0, self.turret.config.detection_radius))
+            airborne_bonus = 0.35 if sim_target.target.is_airborne else 0.0
+            threat = (sim_target.target.priority + 1) * 0.4 + proximity + airborne_bonus
+            if threat <= 0:
+                continue
+            designations.append(
+                TargetDesignation(
+                    target_id=sim_target.target.id,
+                    threat=threat,
+                    ttl=2.5,
+                    sensor_id="allied-radar",
+                )
+            )
+        if designations:
+            self.turret.ingest_designations(designations)
+            self.feedback_events.append(f"allied pings {len(designations)}x")
 
     def _on_heat_feedback(self, heat: float, capacity: float, overheated: bool) -> None:
         state = "overheated" if overheated else "cooling" if heat < capacity * 0.25 else "warm"
@@ -440,6 +493,9 @@ class TurretSimulation:
     def _record_capture_stream(self, frame: int, payload: Dict[str, object]) -> None:
         tracked = payload.get("tracked_target") or "idle"
         self.capture_stream_events.append(f"f{frame}:{tracked}")
+        if fired_at:
+            status += f" -> Fired at target {fired_at}!"
+        print(status)
 
 
 def main() -> None:
