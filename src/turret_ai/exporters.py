@@ -76,8 +76,28 @@ class RpcTelemetryExporter:
         return None
 
 
+class CaptureOverlayTelemetryExporter:
+    """Mirror telemetry alongside capture frame indices for replay overlays."""
+
+    def __init__(self, sink: Callable[[int, dict], None]) -> None:
+        self._sink = sink
+        self._frame_index = 0
+
+    def send(self, telemetry: "TurretTelemetry") -> None:
+        payload = _telemetry_to_dict(telemetry)
+        try:
+            self._sink(self._frame_index, payload)
+        except TypeError:
+            self._sink((self._frame_index, payload))
+        self._frame_index += 1
+
+    def close(self) -> None:  # pragma: no cover - stateless helper
+        return None
+
+
 __all__ = [
     "TelemetryExporter",
     "WebSocketTelemetryExporter",
     "RpcTelemetryExporter",
+    "CaptureOverlayTelemetryExporter",
 ]
