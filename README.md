@@ -1,16 +1,21 @@
 # Galileo Turret AI
 
-This repository implements a lightweight STS 3D-inspired turret AI. It provides:
+An STS 3D-inspired turret controller featuring predictive aiming, cover awareness, ammunition loadouts, heat management, and optional designer overrides.
 
-- Core turret logic with target selection, predictive intercept aiming, and firing heuristics.
-- A simple command line simulation to visualise behaviour and real-time predictions.
-- Automated tests covering key interactions.
+## Features
+
+- Target acquisition, prioritisation, and predictive lead calculation using analytical intercept solving.
+- Configurable firing logic with cooldowns, fire arcs, and obstruction checks that can run full scene queries or navmesh raycasts.
+- Multiple ammunition types with per-shot projectile speed, damage, heat, and power draw attributes plus helpers to select or cycle loadouts at runtime.
+- Heat and power budget systems that throttle cadence, trigger feedback callbacks, and respect cooling dynamics under sustained fire.
+- Idle scanning, manual override waypoint queues, and scripted burst-fire behaviours for cinematic or player-directed control.
+- Lightweight vector math utilities, simulation CLI, and comprehensive unit tests.
 
 ## Getting started
 
-The project uses Python 3.11+.
+The project targets **Python 3.11+**.
 
-1. Create a virtual environment and install dependencies (only `pytest` for tests).
+1. Create and activate a virtual environment, then install development dependencies:
 
    ```bash
    python -m venv .venv
@@ -18,57 +23,50 @@ The project uses Python 3.11+.
    pip install -r requirements-dev.txt
    ```
 
-2. Run the demo simulation:
+2. Run the interactive simulation demo:
 
    ```bash
    python -m src.simulate
    ```
 
-3. Execute the test suite:
+3. Execute the automated tests:
 
    ```bash
    pytest
    ```
 
-## Project structure
+## Project layout
 
-- `src/turret_ai/geometry.py` – minimal 3D vector helpers.
-- `src/turret_ai/turret.py` – turret controller and AI logic, including lead prediction and configurable cooldowns.
-- `src/simulate.py` – command line simulation demonstrating the turret.
-- `tests/` – unit tests.
+| Path | Description |
+| --- | --- |
+| `src/turret_ai/geometry.py` | Minimal vector helpers for yaw/pitch transforms and intercept calculations. |
+| `src/turret_ai/turret.py` | Turret controller implementation with ammunition, heat, power, obstruction, and override systems. |
+| `src/simulate.py` | CLI simulation that visualises tracking, obstruction sampling, ammunition cycling, and heat feedback hooks. |
+| `tests/` | Pytest suite covering predictive aiming, manual overrides, obstruction checks, heat throttling, and ammunition flow. |
 
 ## Configuration highlights
 
-Key tuning parameters on `TurretConfig`:
+Important knobs on `TurretConfig`:
 
-- `max_turn_rate_deg`: constrain how quickly yaw and pitch respond.
-- `fire_arc_deg`: allowable misalignment before firing.
-- `ammunition_types`: define projectile speed, damage, and heat footprint for each ammo class. The active ammunition can be cycled at runtime.
-- `obstruction_check`: optional callback used for ray/shape tests so the turret respects cover when lining up a shot.
-- `heat_*` values: configure heat capacity, overheating thresholds, and passive dissipation to throttle sustained fire.
-- `heat_feedback`: hook for relaying heat changes to VFX/audio or downstream systems.
-- `power_*` values: optional energy management that throttles firing when batteries are drained.
-- `max_prediction_time`: cap on lead prediction to avoid chasing very distant solutions.
-- `fire_cooldown`: configurable cadence between shots.
-- `idle_scan_*`: tune the amplitude and speed of the idle scanning animation when no targets are available.
+- `max_turn_rate_deg`: constrains yaw/pitch speed when tracking targets.
+- `fire_arc_deg`: tolerance before a shot may be fired.
+- `max_prediction_time`: prevents leading calculations from chasing extremely distant solutions.
+- `fire_cooldown`: sets the minimum time between shots.
+- `ammunition_types`: registers available ammunition archetypes with projectile speed, damage, heat, and power draw metadata.
+- `obstruction_check`: optional callback returning obstruction metadata; use it to hook navmesh or physics queries.
+- `heat_*` values: configure heat capacity, cooling thresholds, and dissipation rates.
+- `heat_feedback`: callback fired when heat changes so you can drive VFX, audio, or UI.
+- `power_*` values: tune the energy system so low reserves pause firing until recharged.
+- `idle_scan_*`: controls idle scanning amplitude and cadence when no targets are present.
+- `manual_override`: supply scripted waypoint queues and burst-fire settings for choreographed sequences.
 
-## Advanced behaviours
+## Extensibility ideas
 
-Beyond predictive aiming, the turret now models:
+- Integrate cooperative target designations or threat scoring from allied sensors.
+- Feed obstruction metadata into spatial audio occlusion or impact effects.
+- Blend turret orientation with animation rigs or IK solvers for character-driven platforms.
+- Surface telemetry to external monitoring or debugging dashboards.
 
-- Multiple ammunition archetypes with distinct projectile speeds, damage, and heat costs, plus helpers to cycle or select ammunition in response to threats.
-- Line-of-sight gating through a user-provided obstruction check that can return detailed scene query data (e.g. navmesh hits) so terrain and cover block shots while exposing impact metadata.
-- Heat management that drives optional visual/audio feedback hooks and ties into configurable power draw requirements when firing.
-- Idle scanning behaviour to keep the turret lively when no targets are tracked.
-- Manual override controls with waypoint queues and scripted burst fire so designers can choreograph sequences or let players temporarily take command.
+## License
 
-Manual override sequences are described with `ManualWaypoint` objects which include dwell windows and optional burst fire counts to choreograph camera-ready sweeps.
-
-### Extensibility ideas
-
-Future enhancements could include:
-
-- Integrating cooperative target designations from allied sensors.
-- Adding spatial audio occlusion based on the obstruction metadata.
-- Driving animation rigs directly from the turret orientation to blend with character poses.
-
+This project is provided for demonstration purposes; adapt or extend it to match your game's licensing needs.
