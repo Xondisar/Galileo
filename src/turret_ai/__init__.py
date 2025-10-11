@@ -1,17 +1,19 @@
 """Turret AI package exposing the main control classes."""
-from .geometry import Vector3, UP, solve_intercept_time
+from __future__ import annotations
+
 from .exporters import (
     CaptureOverlayTelemetryExporter,
     RpcTelemetryExporter,
     TelemetryExporter,
     WebSocketTelemetryExporter,
 )
+from .geometry import UP, Vector3, solve_intercept_time
 from .turret import (
     AmmunitionType,
     ManualWaypoint,
     ObstructionSample,
-    TargetDesignation,
     Target,
+    TargetDesignation,
     Turret,
     TurretConfig,
     TurretState,
@@ -22,11 +24,8 @@ __all__ = [
     "AmmunitionType",
     "ManualWaypoint",
     "ObstructionSample",
-    "TargetDesignation",
-from .turret import Target, Turret, TurretConfig, TurretState
-
-__all__ = [
     "Target",
+    "TargetDesignation",
     "Turret",
     "TurretConfig",
     "TurretState",
@@ -39,4 +38,3 @@ __all__ = [
     "RpcTelemetryExporter",
     "CaptureOverlayTelemetryExporter",
 ]
-
